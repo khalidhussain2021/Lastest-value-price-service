@@ -1,91 +1,106 @@
 package com.hussain.serviceImpl;
 
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 import org.springframework.stereotype.Service;
 
 import com.hussain.dto.BatchContext;
-import com.hussain.dto.BatchStatus;
 import com.hussain.dto.PriceRecord;
 import com.hussain.service.PriceService;
 
 @Service
-public class PriceServiceImpl implements PriceService{
+public class PriceServiceImpl implements PriceService {
 
-	private final Map<String, BatchContext> batches = new ConcurrentHashMap<>();
-	private final AtomicReference<Map<String, PriceRecord>> latestPrices =new AtomicReference<>(new HashMap<>());
-	
+	private final Map<String, BatchContext> activeBatches = new ConcurrentHashMap<>();
+
+	// Latest prices by instrument ID (only from completed batches)
+	private final Map<String, PriceRecord> latestPrices = new ConcurrentHashMap<>();
+
+	// For generating unique batch IDs
+	private final AtomicLong batchCounter = new AtomicLong(0);
+
+	// Maximum chunk size as per requirements
+	private static final int MAX_CHUNK_SIZE = 1000;
+
+	@Override
 	public String startBatch() {
-		String batchId = UUID.randomUUID().toString();
-        batches.put(batchId, new BatchContext());
+		String batchId = "BATCH-" + batchCounter.incrementAndGet();
+		activeBatches.put(batchId, new BatchContext(batchId));
 		return batchId;
 	}
 
+	@Override
 	public void uploadPrices(String batchId, List<PriceRecord> prices) {
-		BatchContext context = batches.get(batchId);
-
-        if (context == null || context.status != BatchStatus.STARTED) {
-            throw new IllegalStateException("Invalid batch state");
-        }
-
-        for (PriceRecord record : prices) {
-            context.batchPrices.merge(
-                    record.getId(),
-                    record,
-                    (oldVal, newVal) ->
-                            newVal.getAsOf().isAfter(oldVal.getAsOf()) ? newVal : oldVal
-            );
-        }
+		validateChunkSize(prices);
+		BatchContext batch = activeBatches.get(batchId);
+		if (batch == null) {
+			throw new IllegalArgumentException("Batch not found: " + batchId);
+		}
+		// Add all records to the batch (handles concurrency internally)
+		for (PriceRecord record : prices) {
+			batch.addRecord(record);
+		}
 	}
 
-	public void completeBatch(String batchId) {
-		
-		BatchContext context = batches.get(batchId);
-        if (context == null || context.status != BatchStatus.STARTED) {
-            return;
-        }
-        synchronized (this) {
-            Map<String, PriceRecord> merged =
-                    new HashMap<>(latestPrices.get());
+	@Override
+	public boolean completeBatch(String batchId) {
+		BatchContext batch = activeBatches.remove(batchId);
+		if (batch == null) {
+			return false; // Batch not found or already removed
+		}
 
-            for (PriceRecord record : context.batchPrices.values()) {
-                merged.merge(
-                        record.getId(),
-                        record,
-                        (oldVal, newVal) ->
-                                newVal.getAsOf().isAfter(oldVal.getAsOf()) ? newVal : oldVal
-                );
-            }
-
-            latestPrices.set(Collections.unmodifiableMap(merged));
-            context.status = BatchStatus.COMPLETED;
-        }
+		if (batch.complete()) {
+			// Atomically update latest prices with batch records
+			updateLatestPrices(batch.getRecords());
+			return true;
+		}
+		return false;
 	}
 
-	public void cancelBatch(String batchId) {
-		BatchContext context = batches.get(batchId);
-        if (context != null) {
-            context.status = BatchStatus.CANCELLED;
-            context.batchPrices.clear();
-        }
+	@Override
+	public boolean cancelBatch(String batchId) {
+		BatchContext batch = activeBatches.remove(batchId);
+		if (batch == null) {
+			return false;
+		}
+		return batch.cancel();
 	}
 
+	@Override
 	public Map<String, PriceRecord> getLastPrices(List<String> ids) {
-		Map<String, PriceRecord> snapshot = latestPrices.get();
-        Map<String, PriceRecord> result = new HashMap<>();
+		Map<String, PriceRecord> snapshot = new HashMap<>(latestPrices);
 
-        for (String id : ids) {
-            if (snapshot.containsKey(id)) {
-                result.put(id, snapshot.get(id));
-            }
-        }
-        return result;
-    }
-	
+		return ids.stream().distinct().filter(snapshot::containsKey).collect(Collectors.toMap(id -> id, snapshot::get));
+	}
+
+	@Override
+	public PriceRecord getLatestPrice(String id) {
+		return latestPrices.get(id);
+	}
+
+	private void updateLatestPrices(Map<String, PriceRecord> batchRecords) {
+		for (Map.Entry<String, PriceRecord> entry : batchRecords.entrySet()) {
+			latestPrices.merge(entry.getKey(), entry.getValue(),
+					(existing, incoming) -> incoming.getAsOf().isAfter(existing.getAsOf()) ? incoming : existing);
+		}
+	}
+
+	private void validateChunkSize(List<PriceRecord> records) {
+		if (records == null) {
+			throw new IllegalArgumentException("Records list cannot be null");
+		}
+		if (records.size() > MAX_CHUNK_SIZE) {
+			throw new IllegalArgumentException(
+					String.format("Chunk size %d exceeds maximum of %d", records.size(), MAX_CHUNK_SIZE));
+		}
+	}
+
+	Map<String, BatchContext> getActiveBatches() {
+		return new HashMap<>(activeBatches);
+	}
 }

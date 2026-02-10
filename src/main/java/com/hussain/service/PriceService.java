@@ -9,7 +9,8 @@ public interface PriceService {
 	
 	    String startBatch();
 	    void uploadPrices(String batchId, List<PriceRecord> prices);
-	    void completeBatch(String batchId);
-	    void cancelBatch(String batchId);
+	    boolean completeBatch(String batchId);
+	    boolean cancelBatch(String batchId);
 	    Map<String, PriceRecord> getLastPrices(List<String> ids);
+	    PriceRecord getLatestPrice(String id);
 }
